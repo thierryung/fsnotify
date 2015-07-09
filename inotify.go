@@ -15,21 +15,36 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
 // Watcher watches a set of files, delivering events to a channel.
 type Watcher struct {
-	Events   chan Event
-	Errors   chan error
-	mu       sync.Mutex // Map access
-	fd       int
-	poller   *fdPoller
-	watches  map[string]*watch // Map of inotify watches (key: path)
-	paths    map[int]string    // Map of watched paths (key: watch descriptor)
-	done     chan struct{}     // Channel for sending a "quit message" to the reader goroutine
-	doneResp chan struct{}     // Channel to respond to Close
+	Events      chan Event
+	Errors      chan error
+	mu          sync.Mutex // Map access
+	muq         sync.Mutex // Queue access
+	fd          int
+	poller      *fdPoller
+	watches     map[string]*watch // Map of inotify watches (key: path)
+	paths       map[int]string    // Map of watched paths (key: watch descriptor)
+	done        chan struct{}     // Channel for sending a "quit message" to the reader goroutine
+	doneResp    chan struct{}     // Channel to respond to Close
+	doneProcess chan struct{}     // Channel to respond to Close for processQueue
+	queue       []EventTime       // Queue of events
 }
+
+// EventTime will track of an event's time so we can buffer them
+type EventTime struct {
+	Event
+	cookie uint32
+	mask   uint32
+	t      time.Time
+}
+
+// How long to delay sending events, in milliseconds
+const BufferDelay = 500
 
 // NewWatcher establishes a new watcher with the underlying OS and begins waiting for events.
 func NewWatcher() (*Watcher, error) {
@@ -45,17 +60,20 @@ func NewWatcher() (*Watcher, error) {
 		return nil, err
 	}
 	w := &Watcher{
-		fd:       fd,
-		poller:   poller,
-		watches:  make(map[string]*watch),
-		paths:    make(map[int]string),
-		Events:   make(chan Event),
-		Errors:   make(chan error),
-		done:     make(chan struct{}),
-		doneResp: make(chan struct{}),
+		fd:          fd,
+		poller:      poller,
+		watches:     make(map[string]*watch),
+		paths:       make(map[int]string),
+		Events:      make(chan Event),
+		Errors:      make(chan error),
+		done:        make(chan struct{}),
+		doneResp:    make(chan struct{}),
+		doneProcess: make(chan struct{}),
+		queue:       make([]EventTime, 0),
 	}
 
 	go w.readEvents()
+	go w.processQueue()
 	return w, nil
 }
 
@@ -76,6 +94,7 @@ func (w *Watcher) Close() error {
 
 	// Send 'close' signal to goroutine, and set the Watcher to closed.
 	close(w.done)
+	close(w.doneProcess)
 
 	// Wake up goroutine
 	w.poller.wake()
@@ -166,7 +185,6 @@ func (w *Watcher) readEvents() {
 
 	defer close(w.doneResp)
 	defer close(w.Errors)
-	defer close(w.Events)
 	defer syscall.Close(w.fd)
 	defer w.poller.close()
 
@@ -232,6 +250,7 @@ func (w *Watcher) readEvents() {
 
 			mask := uint32(raw.Mask)
 			nameLen := uint32(raw.Len)
+			cookie := uint32(raw.Cookie)
 			// If the event happened to the watched directory or the watched file, the kernel
 			// doesn't append the filename to the event, but we would like to always fill the
 			// the "Name" field with a valid filename. We retrieve the path of the watch from
@@ -250,17 +269,94 @@ func (w *Watcher) readEvents() {
 
 			// Send the events that are not ignored on the events channel
 			if !event.ignoreLinux(mask) {
-				select {
-				case w.Events <- event:
-				case <-w.done:
-					return
-				}
+				w.muq.Lock()
+				w.addEvent(event, mask, cookie)
+				w.muq.Unlock()
 			}
 
 			// Move to the next event in the buffer
 			offset += syscall.SizeofInotifyEvent + nameLen
 		}
 	}
+}
+
+func (w *Watcher) addEvent(e Event, mask uint32, cookie uint32) {
+	event := EventTime{Event: e, mask: mask, cookie: cookie}
+	event.t = time.Now()
+	w.queue = append(w.queue, event)
+}
+
+// processQueue implements a delayed queue for events
+// so renames have time to catch up to each other
+func (w *Watcher) processQueue() {
+
+	defer close(w.Events)
+
+	for {
+		// See if we have been closed.
+		if w.isClosed() {
+			return
+		}
+
+		// Process all in queue
+		if len(w.queue) > 0 {
+			e := w.queue[0]
+
+			// Check for our insert time, sleep if we haven't waited long enough
+			timeProcess := e.t.Add(BufferDelay * time.Millisecond)
+			timeNow := time.Now()
+			if timeNow.Before(timeProcess) {
+				time.Sleep(timeNow.Sub(timeProcess))
+			}
+
+			w.muq.Lock()
+			// Rename case, check if we have a matching rename_to
+			if e.mask&syscall.IN_MOVED_FROM == syscall.IN_MOVED_FROM {
+				// Look for our MOVE_TO
+				index, el := w.findMatchingTo(e)
+				// We found one, remove it, update our MOVE_FROM event, remove our MOVE_TO event
+				if index != -1 {
+					e.NameTo = el.Name
+					w.removeFromQueue(index)
+				} else {
+					// We did not find a matching MOVE_TO event, consider as delete
+					// Remove rename, set to Remove instead
+					e.Op &^= Rename
+					e.Op |= Remove
+				}
+			}
+			w.shift()
+			w.muq.Unlock()
+
+			// Send event to channel
+			//w.Events <- Event{Name: e.Name, NameTo: e.NameTo, Op: e.Op}
+			select {
+			case w.Events <- Event{Name: e.Name, NameTo: e.NameTo, Op: e.Op}:
+			case <-w.doneProcess:
+				return
+			}
+
+		}
+	}
+}
+
+func (w *Watcher) removeFromQueue(i int) {
+	// From Slick Tricks https://github.com/golang/go/wiki/SliceTricks
+	w.queue[len(w.queue)-1], w.queue = EventTime{}, append(w.queue[:i], w.queue[i+1:]...)
+}
+
+func (w *Watcher) shift() {
+	w.queue[0] = EventTime{}
+	w.queue = w.queue[1:]
+}
+
+func (w *Watcher) findMatchingTo(e EventTime) (int, EventTime) {
+	for ind, el := range w.queue {
+		if el.cookie == e.cookie && el.mask&syscall.IN_MOVED_TO == syscall.IN_MOVED_TO {
+			return ind, el
+		}
+	}
+	return -1, EventTime{}
 }
 
 // Certain types of events can be "ignored" and not sent over the Events

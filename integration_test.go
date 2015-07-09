@@ -584,7 +584,7 @@ func TestFsnotifyRename(t *testing.T) {
 	go func() {
 		for event := range eventstream {
 			// Only count relevant events
-			if event.Name == filepath.Clean(testDir) || event.Name == filepath.Clean(testFile) || event.Name == filepath.Clean(testFileRenamed) {
+			if event.Name == filepath.Clean(testFile) && event.NameTo == filepath.Clean(testFileRenamed) {
 				if event.Op&Rename == Rename {
 					renameReceived.increment()
 				}
